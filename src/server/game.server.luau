@@ -8,7 +8,40 @@ RemoteFolder.Name = "OniGameRemotes"
 local PlaceTrapEvent = RemoteFolder:FindFirstChild("PlaceTrapRequest") or Instance.new("RemoteEvent", RemoteFolder)
 PlaceTrapEvent.Name = "PlaceTrapRequest"
 
-local TrapModule = require(script.Parent.Parent.shared:WaitForChild("trap_module"))
+-- Robustly locate and require the shared trap module from common locations.
+local TrapModule
+do
+    local found
+    local ReplicatedStorage = game:GetService("ReplicatedStorage")
+    -- Check common locations in order
+    if ReplicatedStorage:FindFirstChild("trap_module") then
+        found = ReplicatedStorage:FindFirstChild("trap_module")
+    elseif script:FindFirstChild("trap_module") then
+        found = script:FindFirstChild("trap_module")
+    elseif script.Parent and script.Parent:FindFirstChild("trap_module") then
+        found = script.Parent:FindFirstChild("trap_module")
+    elseif script.Parent and script.Parent.Parent and script.Parent.Parent:FindFirstChild("shared") and script.Parent.Parent.shared:FindFirstChild("trap_module") then
+        found = script.Parent.Parent.shared:FindFirstChild("trap_module")
+    end
+
+    if found then
+        local ok, mod = pcall(require, found)
+        if ok then
+            TrapModule = mod
+        else
+            warn("Failed to require trap_module:", mod)
+        end
+    else
+        warn("trap_module not found in ReplicatedStorage or script ancestors; using noop fallback")
+    end
+
+    -- Fallback to noop module to avoid nil errors
+    if not TrapModule then
+        TrapModule = {}
+        TrapModule.placeTrapForPlayer = function() end
+        TrapModule.removeTrapForPlayer = function() end
+    end
+end
 
 local playerHP = {}
 local ghosts = {}
@@ -16,6 +49,9 @@ local ghosts = {}
 local GAME_DURATION = 30
 local gameStartTime = tick()
 local gameEnded = false
+
+-- Spawn area radius (map random spawn will be within +/- this on X/Z from map center)
+local spawnRange = 100
 
 local function ensureCharacter(player)
     return player.Character or player.CharacterAdded:Wait()
@@ -55,20 +91,36 @@ local function spawnGhostAbove(position)
     local oni = Instance.new("Part")
     oni.Name = "Oni"
     oni.Size = Vector3.new(2,2,2)
+    oni.Shape = Enum.PartType.Ball
     oni.Position = position + Vector3.new(0,50,0)
     oni.Anchored = false
     oni.CanCollide = true
     oni.Parent = workspace
 
-    local meta = {part = oni, stun = 0}
+    -- ghost meta: hp, stun, landed state
+    local meta = {part = oni, stun = 0, hp = 1, landed = false}
     table.insert(ghosts, meta)
+    warn("Spawned Oni part at " .. tostring(oni.Position))
 
+    -- Landing detection: when touching non-player part first time, mark as landed
+    local landConn
+    landConn = oni.Touched:Connect(function(hit)
+        if meta.landed then return end
+        local player = Players:GetPlayerFromCharacter(hit.Parent)
+        if not player then
+            meta.landed = true
+            warn("Oni landed at " .. tostring(oni.Position))
+            if landConn then landConn:Disconnect() end
+        end
+    end)
+
+    -- Damage and trap handling (only apply damage after landing)
     oni.Touched:Connect(function(hit)
         if gameEnded then return end
         local character = hit.Parent
         local player = Players:GetPlayerFromCharacter(character)
         if player and playerHP[player.UserId] then
-            if meta.stun <= 0 then
+            if meta.landed and meta.stun <= 0 then
                 playerHP[player.UserId] = playerHP[player.UserId] - 1
                 meta.stun = 1 -- 1 second stop
                 if playerHP[player.UserId] <= 0 then
@@ -76,7 +128,7 @@ local function spawnGhostAbove(position)
                 end
             end
         end
-        -- trap interaction handled by TrapModule
+        -- trap interaction handled by TrapModule (trap_module listens for Oni touching trap parts)
     end)
 end
 
@@ -113,28 +165,24 @@ RunService.Heartbeat:Connect(function(dt)
         return
     end
 
-    -- spawn logic: spawn count triples each second
+    -- spawn logic: spawn count increases by +1 each second (additive)
     local seconds = math.floor(elapsed)
-    local spawnCount = math.max(1, math.floor(spawnBase * (3 ^ seconds)))
+    local spawnCount = math.max(1, math.floor(spawnBase + seconds))
     if tick() - lastSpawnTick >= 1 then
-        -- spawn near the farthest player
-        local farthest, fdist
-        for _, p in pairs(Players:GetPlayers()) do
-            local ch = p.Character
-            if ch and ch:FindFirstChild("HumanoidRootPart") then
-                local d = (ch.HumanoidRootPart.Position - workspace:GetModelBounds().Position).Magnitude
-                if not fdist or d > fdist then
-                    fdist = d; farthest = p
-                end
-            end
+        -- spawn at random map positions (map center if available)
+        local mapCenter = Vector3.new(0,0,0)
+        local Map = workspace:FindFirstChild("Map")
+        if Map and Map.PrimaryPart then
+            mapCenter = Map.PrimaryPart.Position
         end
-        local basePos = Vector3.new(0,0,0)
-        if farthest and farthest.Character and farthest.Character:FindFirstChild("HumanoidRootPart") then
-            basePos = farthest.Character.HumanoidRootPart.Position
-        end
+        local basePos = mapCenter
         for i=1, spawnCount do
-            local offset = Vector3.new((math.random()-0.5)*20,0,(math.random()-0.5)*20)
-            spawnGhostAbove(basePos + offset)
+            -- choose a random X/Z within spawnRange around map center
+            local rx = math.random(-spawnRange, spawnRange)
+            local rz = math.random(-spawnRange, spawnRange)
+            local spawnPos = basePos + Vector3.new(rx, 0, rz)
+            warn("Spawning Oni at " .. tostring(spawnPos))
+            spawnGhostAbove(spawnPos)
         end
         lastSpawnTick = tick()
     end
@@ -146,13 +194,16 @@ RunService.Heartbeat:Connect(function(dt)
             table.remove(ghosts, i)
         else
             if g.stun > 0 then g.stun = math.max(0, g.stun - dt) end
-            if g.stun <= 0 then
+            if g.stun <= 0 and g.landed then
                 local target = findNearestPlayer(g.part.Position)
                 if target and target.Character and target.Character:FindFirstChild("HumanoidRootPart") then
                     local tgtpos = target.Character.HumanoidRootPart.Position
                     local dir = (tgtpos - g.part.Position)
                     if dir.Magnitude > 1 then
-                        local speed = (16/10) -- player speed /10
+                        -- Ghost speed is player speed / 10
+                        local humanoid = target.Character and target.Character:FindFirstChild("Humanoid")
+                        local playerSpeed = (humanoid and humanoid.WalkSpeed) or 16
+                        local speed = playerSpeed / 10
                         g.part.Velocity = dir.Unit * speed
                     end
                 end

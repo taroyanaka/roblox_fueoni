@@ -1,0 +1,430 @@
+<roblox version="4">
+  <Item class="Lighting" referent="0">
+    <Properties>
+      <string name="Name">Lighting</string>
+      <Color3 name="Ambient">
+        <R>0</R>
+        <G>0</G>
+        <B>0</B>
+      </Color3>
+      <float name="Brightness">2</float>
+      <bool name="GlobalShadows">true</bool>
+      <bool name="Outlines">false</bool>
+      <token name="Technology">1</token>
+    </Properties>
+  </Item>
+  <Item class="ReplicatedStorage" referent="1">
+    <Properties>
+      <string name="Name">ReplicatedStorage</string>
+    </Properties>
+    <Item class="Folder" referent="2">
+      <Properties>
+        <string name="Name">Shared</string>
+      </Properties>
+      <Item class="ModuleScript" referent="3">
+        <Properties>
+          <string name="Name">Hello</string>
+          <string name="Source"><![CDATA[return function()
+	print("Hello, world!")
+end
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="4">
+        <Properties>
+          <string name="Name">trap_module</string>
+          <string name="Source"><![CDATA[local Players = game:GetService("Players")
+
+local traps = {} -- traps[player.UserId] = {part = Part}
+
+local function makeTrapPart(position)
+    local part = Instance.new("Part")
+    part.Name = "OniTrap"
+    part.Size = Vector3.new(5, 0.2, 5)
+    part.Position = Vector3.new(position.X, position.Y + 0.1, position.Z)
+    part.Anchored = true
+    part.CanCollide = false
+    part.Transparency = 0.5
+    part.Parent = workspace
+    return part
+end
+
+local function onTrapTouched(part, other)
+    if other and other.Name == "Oni" then
+        -- destroy the ghost
+        other:Destroy()
+    end
+end
+
+local module = {}
+
+function module.placeTrapForPlayer(player, position)
+    -- remove existing
+    module.removeTrapForPlayer(player)
+    local trapPart = makeTrapPart(position)
+    local conn
+    conn = trapPart.Touched:Connect(function(hit)
+        if hit and hit.Name == "Oni" then
+            hit:Destroy()
+        end
+    end)
+    traps[player.UserId] = {part = trapPart, conn = conn}
+end
+
+function module.removeTrapForPlayer(player)
+    local t = traps[player.UserId]
+    if t then
+        if t.conn then t.conn:Disconnect() end
+        if t.part and t.part.Parent then t.part:Destroy() end
+        traps[player.UserId] = nil
+    end
+end
+
+return module
+]]></string>
+        </Properties>
+      </Item>
+    </Item>
+  </Item>
+  <Item class="ServerScriptService" referent="5">
+    <Properties>
+      <string name="Name">ServerScriptService</string>
+    </Properties>
+    <Item class="Script" referent="6">
+      <Properties>
+        <string name="Name">Server</string>
+        <token name="RunContext">0</token>
+        <string name="Source"><![CDATA[local success, err = pcall(function()
+	local gameServer = require(script.Parent:FindFirstChild("game.server") or script.Parent:FindFirstChild("game_server") )
+	if type(gameServer) == "table" and type(gameServer.start) == "function" then
+		gameServer.start()
+	end
+end)
+if not success then
+	warn("game server failed to start:", err)
+end
+]]></string>
+      </Properties>
+      <Item class="Script" referent="7">
+        <Properties>
+          <string name="Name">game</string>
+          <token name="RunContext">0</token>
+          <string name="Source"><![CDATA[local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+-- RemoteEvents
+local RemoteFolder = ReplicatedStorage:FindFirstChild("OniGameRemotes") or Instance.new("Folder", ReplicatedStorage)
+RemoteFolder.Name = "OniGameRemotes"
+local PlaceTrapEvent = RemoteFolder:FindFirstChild("PlaceTrapRequest") or Instance.new("RemoteEvent", RemoteFolder)
+PlaceTrapEvent.Name = "PlaceTrapRequest"
+
+-- Robustly locate and require the shared trap module from common locations.
+local TrapModule
+do
+    local found
+    local ReplicatedStorage = game:GetService("ReplicatedStorage")
+    -- Check common locations in order
+    if ReplicatedStorage:FindFirstChild("trap_module") then
+        found = ReplicatedStorage:FindFirstChild("trap_module")
+    elseif script:FindFirstChild("trap_module") then
+        found = script:FindFirstChild("trap_module")
+    elseif script.Parent and script.Parent:FindFirstChild("trap_module") then
+        found = script.Parent:FindFirstChild("trap_module")
+    elseif script.Parent and script.Parent.Parent and script.Parent.Parent:FindFirstChild("shared") and script.Parent.Parent.shared:FindFirstChild("trap_module") then
+        found = script.Parent.Parent.shared:FindFirstChild("trap_module")
+    end
+
+    if found then
+        local ok, mod = pcall(require, found)
+        if ok then
+            TrapModule = mod
+        else
+            warn("Failed to require trap_module:", mod)
+        end
+    else
+        warn("trap_module not found in ReplicatedStorage or script ancestors; using noop fallback")
+    end
+
+    -- Fallback to noop module to avoid nil errors
+    if not TrapModule then
+        TrapModule = {}
+        TrapModule.placeTrapForPlayer = function() end
+        TrapModule.removeTrapForPlayer = function() end
+    end
+end
+
+local playerHP = {}
+local ghosts = {}
+
+local GAME_DURATION = 30
+local gameStartTime = tick()
+local gameEnded = false
+
+local function ensureCharacter(player)
+    return player.Character or player.CharacterAdded:Wait()
+end
+
+local function setPlayerHP(player, hp)
+    playerHP[player.UserId] = hp
+    -- could fire client HUD update
+end
+
+local function playerLose(player)
+    if gameEnded then return end
+    gameEnded = true
+    warn(player.Name .. " lost the game")
+    -- notify players
+end
+
+local function findNearestPlayer(pos)
+    local nearest, ndist
+    for _, p in pairs(Players:GetPlayers()) do
+        local ch = p.Character
+        if ch and ch:FindFirstChild("HumanoidRootPart") then
+            local d = (ch.HumanoidRootPart.Position - pos).Magnitude
+            if not ndist or d < ndist then
+                ndist = d; nearest = p
+            end
+        end
+    end
+    return nearest
+end
+
+local function nearestToPlayer(pos)
+    return findNearestPlayer(pos)
+end
+
+local function spawnGhostAbove(position)
+    local oni = Instance.new("Part")
+    oni.Name = "Oni"
+    oni.Size = Vector3.new(2,2,2)
+    oni.Position = position + Vector3.new(0,50,0)
+    oni.Anchored = false
+    oni.CanCollide = true
+    oni.Parent = workspace
+
+    local meta = {part = oni, stun = 0}
+    table.insert(ghosts, meta)
+
+    warn("Spawned Oni part at " .. tostring(oni.Position))
+
+    oni.Touched:Connect(function(hit)
+        if gameEnded then return end
+        local character = hit.Parent
+        local player = Players:GetPlayerFromCharacter(character)
+        if player and playerHP[player.UserId] then
+            if meta.stun <= 0 then
+                playerHP[player.UserId] = playerHP[player.UserId] - 1
+                meta.stun = 1 -- 1 second stop
+                if playerHP[player.UserId] <= 0 then
+                    playerLose(player)
+                end
+            end
+        end
+        -- trap interaction handled by TrapModule
+    end)
+end
+
+-- Place trap remote handling
+PlaceTrapEvent.OnServerEvent:Connect(function(player, position)
+    -- validate
+    if not position then return end
+    TrapModule.placeTrapForPlayer(player, position)
+end)
+
+-- Player management
+Players.PlayerAdded:Connect(function(player)
+    setPlayerHP(player, 10)
+    player.CharacterAdded:Connect(function(char)
+        -- nothing for now
+    end)
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+    playerHP[player.UserId] = nil
+    TrapModule.removeTrapForPlayer(player)
+end)
+
+-- Main loops: spawn and move ghosts
+local spawnBase = 1 -- base ghosts per second
+local lastSpawnTick = tick()
+
+RunService.Heartbeat:Connect(function(dt)
+    if gameEnded then return end
+    local elapsed = tick() - gameStartTime
+    if elapsed >= GAME_DURATION then
+        gameEnded = true
+        warn("Players survived and win!")
+        return
+    end
+
+    -- spawn logic: spawn count triples each second
+    local seconds = math.floor(elapsed)
+    local spawnCount = math.max(1, math.floor(spawnBase * (3 ^ seconds)))
+    if tick() - lastSpawnTick >= 1 then
+        -- spawn near the farthest player
+        local farthest, fdist
+        for _, p in pairs(Players:GetPlayers()) do
+            local ch = p.Character
+            if ch and ch:FindFirstChild("HumanoidRootPart") then
+                local d = (ch.HumanoidRootPart.Position - Vector3.new(0,0,0)).Magnitude
+                if not fdist or d > fdist then
+                    fdist = d; farthest = p
+                end
+            end
+        end
+        local basePos = Vector3.new(0,0,0)
+        if farthest and farthest.Character and farthest.Character:FindFirstChild("HumanoidRootPart") then
+            basePos = farthest.Character.HumanoidRootPart.Position
+        end
+        for i=1, spawnCount do
+            local offset = Vector3.new((math.random()-0.5)*20,0,(math.random()-0.5)*20)
+            local spawnPos = basePos + offset
+            warn("Spawning Oni at " .. tostring(spawnPos) .. " (farthest=" .. (farthest and farthest.Name or "nil") .. ")")
+            spawnGhostAbove(spawnPos)
+        end
+        lastSpawnTick = tick()
+    end
+
+    -- move ghosts toward nearest player
+    for i=#ghosts,1,-1 do
+        local g = ghosts[i]
+        if not g.part or not g.part.Parent then
+            table.remove(ghosts, i)
+        else
+            if g.stun > 0 then g.stun = math.max(0, g.stun - dt) end
+            if g.stun <= 0 then
+                local target = findNearestPlayer(g.part.Position)
+                if target and target.Character and target.Character:FindFirstChild("HumanoidRootPart") then
+                    local tgtpos = target.Character.HumanoidRootPart.Position
+                    local dir = (tgtpos - g.part.Position)
+                    if dir.Magnitude > 1 then
+                        local speed = (16/10) -- player speed /10
+                        g.part.Velocity = dir.Unit * speed
+                    end
+                end
+            else
+                g.part.Velocity = Vector3.new(0,0,0)
+            end
+        end
+    end
+end)
+
+return {
+    start = function() end
+}
+]]></string>
+        </Properties>
+      </Item>
+    </Item>
+  </Item>
+  <Item class="SoundService" referent="8">
+    <Properties>
+      <string name="Name">SoundService</string>
+      <bool name="RespectFilteringEnabled">true</bool>
+    </Properties>
+  </Item>
+  <Item class="StarterPlayer" referent="9">
+    <Properties>
+      <string name="Name">StarterPlayer</string>
+    </Properties>
+    <Item class="StarterPlayerScripts" referent="10">
+      <Properties>
+        <string name="Name">StarterPlayerScripts</string>
+      </Properties>
+      <Item class="LocalScript" referent="11">
+        <Properties>
+          <string name="Name">Client</string>
+          <string name="Source"><![CDATA[local success, err = pcall(function()
+	local trapClient = require(script.Parent:FindFirstChild("trap.client") or script.Parent:WaitForChild("trap.client"))
+end)
+if not success then
+	warn("trap client failed to load:", err)
+end
+]]></string>
+        </Properties>
+        <Item class="LocalScript" referent="12">
+          <Properties>
+            <string name="Name">trap</string>
+            <string name="Source"><![CDATA[local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local player = Players.LocalPlayer
+local character = player.Character or player.CharacterAdded:Wait()
+local humanoid = character:WaitForChild("Humanoid")
+
+local remotes = ReplicatedStorage:WaitForChild("OniGameRemotes")
+local PlaceTrapEvent = remotes:WaitForChild("PlaceTrapRequest")
+
+local placing = false
+
+local function beginPlace(position)
+    if placing then return end
+    placing = true
+    -- move player to the position and freeze for 2 seconds
+    local root = character:FindFirstChild("HumanoidRootPart")
+    if root then
+        root.CFrame = CFrame.new(position + Vector3.new(0, 2, 0))
+    end
+    local oldWalk = humanoid.WalkSpeed
+    local oldJump = humanoid.JumpPower
+    humanoid.WalkSpeed = 0
+    humanoid.JumpPower = 0
+    wait(2)
+    -- send request to server to create trap
+    PlaceTrapEvent:FireServer(position)
+    humanoid.WalkSpeed = oldWalk
+    humanoid.JumpPower = oldJump
+    placing = false
+end
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+    if input.KeyCode == Enum.KeyCode.E then
+        -- place trap at mouse hit point
+        local mouse = player:GetMouse()
+        local hit = mouse.Hit
+        if hit then
+            local pos = hit.Position
+            beginPlace(pos)
+        end
+    end
+end)
+
+print("Trap client loaded")
+
+return {}
+]]></string>
+          </Properties>
+        </Item>
+      </Item>
+    </Item>
+  </Item>
+  <Item class="Workspace" referent="13">
+    <Properties>
+      <string name="Name">Workspace</string>
+      <bool name="FilteringEnabled">true</bool>
+      <bool name="NeedsPivotMigration">false</bool>
+    </Properties>
+    <Item class="Part" referent="14">
+      <Properties>
+        <string name="Name">Baseplate</string>
+        <bool name="Anchored">true</bool>
+        <Color3uint8 name="Color3uint8">6512483</Color3uint8>
+        <bool name="Locked">true</bool>
+        <Vector3 name="Position">
+          <X>0</X>
+          <Y>-10</Y>
+          <Z>0</Z>
+        </Vector3>
+        <Vector3 name="size">
+          <X>512</X>
+          <Y>20</Y>
+          <Z>512</Z>
+        </Vector3>
+      </Properties>
+    </Item>
+  </Item>
+</roblox>
